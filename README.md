@@ -10,6 +10,8 @@ The repository provides the R-code used to produce the results presented in the 
 - `data_analysis.Rmd` contains the regression modelling part of the analysis as well as the mapping of the spatial eigenvectors, spatially varying regression coefficients and the hierarchical clustering
 - `SAC.Rmd` handles the calculation of the spatial autocorrelation timeseries and the related plot
 
+The files have to be opened in RStudio and then executed either manually code chunk by code chunk, run all at once (Ctrl + Alt + R) or knitted into an HTML document (Ctrl + Shift + k). It will be more convenient if the R project file (R_covid_19_de_github.Rproj) is opened directly in RStudio.
+
 ## Requirements
 
 To run the code the following software is required:
@@ -30,8 +32,10 @@ To run the code the following software is required:
   - readODS 2.3.2 - reading/writing ods documents
 
 The R packages can be installed inside R/Rstudio via the GUI or by the command 
-`install.packages("rmdformats", "tidyverse", "GGally", "ggpubr", "spatialreg", "lubridate", "sf", "spdep", "tmap", "readODS")` (`ggplot2`is part of the base installation of R)
+`install.packages("rmdformats", "tidyverse", "GGally", "ggpubr", "spatialreg", "lubridate", "sf", "spdep", "tmap", "readODS")` 
+(`ggplot2`is part of the base installation of R)
 Depending packages and external libaries should be automatically installed in addition by that step. This includes GDAL (>= 2.0.1), GEOS (>= 3.4.0), PROJ (>= 4.8.0), sqlite3 required by `sf`.
+Packages will be installed by default into a dedicated subdirectory of the home directory (see `?libPaths` for details). This can be changed by specifying the path with the `lib` parameter (see `?install.packages`).
 
 The RMarkdown code assumes that all data is stored in a `data` subfolder and that images are saved in an `img` subfolder.
 
