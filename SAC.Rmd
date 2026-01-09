@@ -1,0 +1,204 @@
+---
+title: "COVID-19 spatial autocorrelation analysis"
+author: ""
+date: "`r Sys.Date()`"
+output:
+  rmdformats::readthedown:
+    highlight: kate
+    gallery: TRUE
+    lightbox: TRUE
+    thumbnails: TRUE
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(rmdformats)
+library(tidyverse)
+library(ggplot2)
+library(GGally)
+library(spatialreg)
+library(ggpubr)
+library(ggrepel)
+library(lubridate)
+library(sf)
+library(spdep)
+library(tmap)
+library(readODS)
+library(latex2exp)
+```
+
+```{r}
+load(file = "data/covidKreise.Rdata") # covidKreise
+load(file = "data/covidTS.Rdata") # -> covidMod
+```
+
+# Spatial weight matrix definitions
+
+Queen contiguity neighborhood definitions:
+
+```{r}
+polynb <- poly2nb(covidKreise)
+```
+
+70km distance band neighborhood definition
+
+```{r}
+poSurfKreise <- st_point_on_surface(covidKreise)
+
+distnb <- dnearneigh(poSurfKreise, d1=1, d2= 70*10^3)
+```
+
+Union contiguity and distance based neighborhood definitions
+
+
+```{r}
+unionedNb <- union.nb(distnb, polynb)
+```
+
+Inverse distance based weighting of neighbors
+
+
+```{r}
+dlist <- nbdists(unionedNb, st_coordinates(poSurfKreise))
+dlist <- lapply(dlist, function(x) 1/x)
+unionedListw_d <- nb2listw(unionedNb, glist=dlist, style = "W")
+```
+
+# Calculate global Moran's I
+
+Loop over all weeks, filter the data, join them with a local copy of the sf object, calculate global Moran's I and store in data frame to be used for plotting.
+
+
+```{r}
+allWeeks <- unique(covidMod$Meldedatum)
+#unique(covidMod$Landkreis_id) %>% length()
+covidKreiseCopy <- covidKreise
+```
+
+```{r, message=FALSE, cache=TRUE}
+globalI_ts <- data.frame(Meldedatum = allWeeks, I=NA, pvalue=NA, Faelle_7.Tage=NA, incidence_7.Tage=NA)
+i <- 0
+# aweek <- allWeeks[100]
+for(aWeek in allWeeks)
+{
+  i <- i+1
+  theSubset <- filter(covidMod, Meldedatum == aWeek)
+  # get sum of cases
+  aggInci <- theSubset %>% group_by(Meldedatum) %>%
+    summarise(sumFaelle_7.Tage = sum(Faelle_7.Tage),
+              sumPop = sum(Bevoelkerung),
+              sum7TageIncidence = sumFaelle_7.Tage/ sumPop * 10 ^5)
+  globalI_ts$Meldedatum[i] <- aWeek
+  globalI_ts$Faelle_7.Tage[i] <- aggInci$sumFaelle_7.Tage
+  globalI_ts$incidence_7.Tage[i] <- aggInci$sum7TageIncidence
+  
+  # join with spatial data
+  theSubsetSf <- left_join(covidKreiseCopy, theSubset, by= join_by(AGS_num == Landkreis_id))
+  
+  
+  
+  if(sum(theSubsetSf$Faelle_7.Tage) >0) 
+  {
+     # calculate empirical Bayes modification
+  ebiMc <- EBImoran.mc(n= st_drop_geometry(theSubsetSf)%>% pull(Faelle_7.Tage),
+              x= theSubsetSf$EWZ, listw = unionedListw_d, nsim =999)
+  globalI_ts$I[i] <- ebiMc$statistic
+  globalI_ts$pvalue[i] <- ebiMc$p.value
+ 
+  } else {
+   globalI_ts$I[i] <- 0
+    globalI_ts$pvalue[i] <- 1
+  }
+ 
+}
+```
+
+
+
+```{r}
+save(globalI_ts, file="data/globalMoransI.Rdata")
+```
+```{r}
+load("data/globalMoransI.Rdata")
+```
+
+Moran's I for the different phases of the pandemic in Germany
+
+
+
+
+```{r}
+covidPhasesDe <- read.table("data/pandemic_phases_germany.csv", sep=",", header=TRUE)
+covidPhasesDe$Begin_date <- covidPhasesDe$Begin_date %>% lubridate::as_date()
+covidPhasesDe$End_date <- covidPhasesDe$End_date %>% lubridate::as_date()
+covidPhasesDe$labelPos <- (covidPhasesDe$End_date - covidPhasesDe$Begin_date)/2 + covidPhasesDe$Begin_date
+# remove first and last entry for figure
+covidPhasesDe <- covidPhasesDe[-c(1,10),]
+```
+
+```{r, message=FALSE}
+covidPhasesDe$MoransI <- NA
+covidPhasesDe$MoransIpval <- NA
+
+phaseFields <- paste0("sumCases4phase_", c("sporadic", "first_wave", "Plateau_2020",
+                                           "second_wave", "third_wave", "Plateau_2021",
+                                           "fourth_wave", "fifth_wave"))
+
+i <- 1
+for (i in 1:length(phaseFields))
+{
+  theStats <- EBImoran.mc(n= st_drop_geometry(covidKreise)%>% pull(phaseFields[i]),
+              x= covidKreise$EWZ, listw = unionedListw_d, nsim =9999)
+  covidPhasesDe$MoransI[i] <- theStats$statistic
+  covidPhasesDe$MoransIpval[i] <- theStats$p.value
+}
+
+
+knitr::kable(covidPhasesDe[, c("Name", "MoransI", "MoransIpval")] )
+```
+
+Calculate the first deviation of the incidence time series
+
+```{r}
+n <- nrow(globalI_ts)
+globalI_ts$incidence_7.Tage_diff1[2:n] <- diff(globalI_ts$incidence_7.Tage)
+globalI_ts$incidence_7.Tage_diff1[1] <- 0 
+```
+
+
+```{r}
+p1 <- ggplot(globalI_ts, aes(y=I, x=Meldedatum)) + geom_step() + 
+  xlab("") + ylab("Moran's I") +
+  geom_vline(mapping= aes(xintercept =  Begin_date), col= "blue", 
+             data= covidPhasesDe, lty=2) +
+  geom_vline(mapping= aes(xintercept =  End_date), col= "blue", 
+             data= covidPhasesDe, lty=2) 
+
+p2 <- ggplot(globalI_ts, aes(y=incidence_7.Tage, x=Meldedatum)) + geom_step() + 
+  xlab("") + ylab("Incidence rate 7 days")+
+  geom_vline(mapping= aes(xintercept =  Begin_date), col= "blue", 
+             data= covidPhasesDe, lty=2) +
+  geom_vline(mapping= aes(xintercept =  End_date), col= "blue", 
+             data= covidPhasesDe, lty=2) +
+  geom_label_repel(data= covidPhasesDe , 
+             mapping= aes(x= labelPos, label= Name, y = rep(c(1000, 500),4) ),
+             max.overlaps = Inf, point.size = NA,
+             size = 2.7) +
+  scale_y_sqrt()
+
+p3 <- ggplot(globalI_ts, aes(y=incidence_7.Tage_diff1, x=Meldedatum)) + geom_step() + 
+  xlab("") + ylab(TeX("$\\Delta$ ncidence rate 7 days")) +
+  geom_vline(mapping= aes(xintercept =  Begin_date), col= "blue", 
+             data= covidPhasesDe, lty=2) +
+  geom_vline(mapping= aes(xintercept =  End_date), col= "blue", 
+             data= covidPhasesDe, lty=2) +
+  coord_cartesian(ylim= c(-20,20))
+
+ggarrange(p1, p3, p2,  ncol=1, nrow=3)
+
+ggsave(filename = "img/moransITimeSeries.png", device = "png", dpi = 300, units="px", width = 1200*3, height = 1050*3)
+```
+
+
+
+

@@ -1,0 +1,255 @@
+---
+title: "COVID-19 data preprocessing"
+author: ""
+date: "`r Sys.Date()`"
+output:
+  rmdformats::readthedown:
+    highlight: kate
+    gallery: TRUE
+    lightbox: TRUE
+    thumbnails: TRUE
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+require(rmdformats)
+require(tidyverse)
+require(ggplot2)
+require(lubridate)
+require(sf)
+require(spdep)
+require(tmap)
+require(readODS)
+```
+
+Data were downloaded from https://github.com/robert-koch-institut/COVID-19_7-Tage-Inzidenz_in_Deutschland at the 12th December 2025.
+
+```{r}
+covid <- read.table("data/COVID-19-Faelle_7-Tage-Inzidenz_Landkreise.csv", header=TRUE, sep=",")
+```
+
+```{r}
+names(covid)
+```
+
+Dataset description^[More details available at https://github.com/robert-koch-institut/COVID-19_7-Tage-Inzidenz_in_Deutschland/blob/main/Metadaten/schemas/tableschema_COVID-19-Faelle_7-Tage-Inzidenz_Landkreise.json]
+
+  - "Meldedatum" - date the local health agency has registered the COVID-19 case
+  - "Landkreis_id" - the ID of the district the case was registered
+  - "Bevoelkerung" - inhabitants
+  - "Faelle_gesamt" - COVID-19 cases since the beginning of data collection
+  - "Faelle_neu"  - new cases
+  - "Faelle_7.Tage" - cases in the last 7 days
+  - "Inzidenz_7.Tage" - incidence rate: cases in the last 7 days per 100,000 inhabitants
+
+Convert the date field into date-format  
+
+```{r}
+covid$Meldedatum <- covid$Meldedatum %>% lubridate::as_date()
+```
+
+
+## Link to spatial data
+
+Get the official administrative boundaries
+
+```{r, eval=FALSE}
+# check if Kreis boundaries are downloaded, if not, do it
+if (!file.exists("data/vg250-ew_12-31.utm32s.shape.ebenen/vg250-ew_ebenen_1231/VG250_KRS.shp")) {
+  download.file(
+    "https://daten.gdz.bkg.bund.de/produkte/vg/vg250-ew_ebenen_1231/2023/vg250-ew_12-31.utm32s.shape.ebenen.zip",
+    destfile = "data/vg250-ew_12-31.utm32s.shape.ebenen.zip",
+    mode = 'wb'
+  )
+  unzip(zipfile = "data/vg250-ew_12-31.utm32s.shape.ebenen.zip",
+        exdir = "data/")
+}
+```
+
+
+```{r}
+kreiseSf <- st_read(dsn = "data/vg250-ew_12-31.utm32s.shape.ebenen/vg250-ew_ebenen_1231/VG250_KRS.shp")
+```
+
+Convert AGS to numeric as the RKI COVID-19 dataset has a numeric key. We lose the leading 0 thereby, which does not matter here.
+
+
+```{r}
+kreiseSf$AGS_num <- as.numeric(kreiseSf$AGS)
+```
+
+
+### Solving problems with the administrative data
+
+Remove the areas representing water bodies. See the documentation accompanying the administrative dataset (in the unziped folder)
+
+```{r}
+kreiseSf <- kreiseSf %>% filter(GF == 4) 
+```
+
+
+
+Do the keys match?
+
+```{r}
+Landkreis_id <- unique(covid$Landkreis_id)
+AGS <- unique(as.numeric(kreiseSf$AGS))
+
+# which district ids from the covid-19 dataset are not in the official administrative boundary dataset
+idx <- which(!(Landkreis_id %in% AGS))
+Landkreis_id[idx]
+
+berlinBezirk_id <- Landkreis_id[idx]
+```
+
+These are the 12 subunits that are used in Berlin (Bezirke): Mitte, Friedrichshain-Kreuzberg, Pankow, Charlottenburg-Wilmersdorf, Spandau, Steglitz-Zehlendorf, Tempelhof-Schöneberg, Neuköln, Treptow-Köpenik, Marzahn-Hellersdorf, Lichtenberg, Reineckendorf. As the socio-economic data (INKAR) does not include those subunits we have to aggregate the cases.
+
+```{r}
+# no entry for the district Berlin present in the data
+which(Landkreis_id == 1100)
+```
+
+```{r}
+bezirkeBerlin <- filter(covid, Landkreis_id %in% berlinBezirk_id)
+
+bezirkeBerlin$dummy <- 1
+
+berlin <- bezirkeBerlin %>% group_by(Meldedatum, dummy) %>%
+  summarise(Landkreis_id = 11000,
+            Bevoelkerung = sum(Bevoelkerung),
+            Faelle_gesamt = sum(Faelle_gesamt),
+            Faelle_neu = sum (Faelle_neu),
+            Faelle_7.Tage = sum(Faelle_7.Tage)) %>%
+  mutate(Inzidenz_7.Tage = Faelle_7.Tage / Bevoelkerung * 10^5)
+berlin$dummy <- NULL
+
+```
+
+Add to the original COVID-19 cases dataset and remove the Bezirke from the data.
+
+```{r}
+covidMod <- covid %>% filter(!(Landkreis_id %in% berlinBezirk_id))
+
+covidMod <- rbind(covidMod, berlin)
+```
+
+
+
+
+```{r}
+ggplot(covidMod, aes(x=Meldedatum, y= Inzidenz_7.Tage, col=Landkreis_id)) +
+  geom_line()
+```
+
+Aggregate cases and incidence by covid-19 waves
+
+```{r}
+covidPhasesDe <- read.table("data/pandemic_phases_germany.csv", sep=",", header=TRUE)
+```
+
+Add phase information
+
+```{r}
+covidMod$phase <- "NA" 
+
+for(i in 1:nrow(covidPhasesDe) )
+{
+  aLabel <- covidPhasesDe$Label[i]
+  startDate <- covidPhasesDe$Begin_date[i]
+  endDate <- covidPhasesDe$End_date[i]
+  
+  idx <- which((covidMod$Meldedatum >= startDate & covidMod$Meldedatum <= endDate))
+  covidMod$phase[idx] <- aLabel
+}
+```
+
+
+
+Calculate the sum of cases and mean inhabitants for this period
+
+
+
+```{r}
+covidAgg <- covidMod %>% group_by(Landkreis_id, phase) %>%
+  summarise(sumCases4phase = sum(Faelle_neu),
+            avgInhab4period = mean(Bevoelkerung),
+            totalIncidence4phase = sumCases4phase/ avgInhab4period * 10^5)
+```
+
+Bring to wide format
+
+```{r}
+covidAgg_wide <- pivot_wider(covidAgg[,c("Landkreis_id", "phase", "sumCases4phase", "totalIncidence4phase")],
+            id_cols = Landkreis_id,
+            names_from=phase, 
+            values_from = c(sumCases4phase, totalIncidence4phase))
+```
+
+Add the total incidence till the end of the fifth wave
+
+```{r}
+covidAgg_tillEnd5th <- covidMod %>% filter(Meldedatum < as_date("2022-06-03")) %>%
+  group_by(Landkreis_id) %>%
+  summarize(casesTillEnd5thWave = sum(Faelle_neu),
+            incidenceTillEnd5thWave = sum(Faelle_neu) / mean(Bevoelkerung) * 10^5)
+
+covidAgg_wide <- left_join(covidAgg_wide, covidAgg_tillEnd5th, by= join_by(Landkreis_id))
+```
+
+
+
+Join with the admin boundaries
+
+```{r}
+kreiseSf <- left_join(kreiseSf, covidAgg_wide, by= join_by(AGS_num == Landkreis_id))
+```
+
+
+```{r}
+tm_shape(kreiseSf) +
+  tm_polygons(fill= "incidenceTillEnd5thWave",
+              fill.chart = tm_chart_histogram(),
+              fill.scale = tm_scale_intervals(values="brewer.reds"),
+              fill.legend = tm_legend(title="Incidence till\nend of 5th wave",
+                                      reverse=TRUE)) +
+  tm_scalebar(position = tm_pos_out(pos.v="bottom"))
+```
+
+# Add covariates
+
+Data needs to be downloaded from:
+
+The data has been extracted from: https://www.inkar.de/
+Meta-data is available at this page as well - unfortunately in German only. Field names are in German as well
+
+```{r}
+load("data/inkarKreisstatistik_preprocessed.Rdata", verbose=TRUE)
+```
+
+
+
+
+```{r}
+covidKreise <- left_join(kreiseSf,  predictors2, by= c("ARS_0" = "RS_0"))
+```
+
+```{r}
+tm_shape(covidKreise) +
+  tm_polygons(fill= "Laendlichkeit",
+              fill.chart = tm_chart_histogram(),
+              fill.scale = tm_scale_intervals(values="brewer.greens"),
+              fill.legend = tm_legend(title="Rurality",
+                                      reverse=TRUE)) +
+  tm_scalebar(position = tm_pos_out(pos.v="bottom"))
+```
+
+Serialize the data for use in the later scripts
+
+```{r}
+save(covidKreise, file = "data/covidKreise.Rdata")
+```
+
+```{r}
+save(covidMod, file = "data/covidTS.Rdata")
+```
+

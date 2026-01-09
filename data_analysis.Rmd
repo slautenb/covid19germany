@@ -1,0 +1,907 @@
+---
+title: "COVID-19 regression analysis"
+author: ""
+date: "`r Sys.Date()`"
+output:
+  rmdformats::readthedown:
+    highlight: kate
+    gallery: TRUE
+    lightbox: TRUE
+    thumbnails: TRUE
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(rmdformats)
+library(tidyverse)
+library(ggplot2)
+library(GGally)
+library(spatialreg)
+library(lubridate)
+library(sf)
+library(spdep)
+library(tmap)
+library(readODS)
+```
+
+```{r}
+load(file = "data/covidKreise.Rdata")
+```
+
+Load the boundaries of the federal states for an overlay of some of the result maps.
+
+```{r}
+federalStates <- st_read("data/vg250-ew_12-31.utm32s.shape.ebenen/vg250-ew_ebenen_1231/VG250_LAN.shp",
+                         quiet=TRUE)
+federalStates <- filter(federalStates, GF==4)
+```
+
+
+# Check correlation between predictors
+
+The t-test for Pearson's r is not correct due to spatial autocorrelation.
+
+```{r, fig.width=11, fig.height=11}
+theLabels <- c("Longterm unempl.", "High qualified", "Votes right-winged", "Inc. commuters",  "Foreigners")
+
+st_drop_geometry(covidKreise) %>% 
+  dplyr::select(Langzeitarbeitslosenquote, 
+                Hochqualifizierte, Stimmenanteile.AfD,
+                Einpendler, Einpendler, 
+                Auslaenderanteil) %>% 
+  ggpairs(progress=FALSE, columnLabels = theLabels) 
+```
+
+
+# Spatial weight matrix definitions
+
+Queen contiguity neighborhood definitions:
+
+```{r}
+polynb <- poly2nb(covidKreise)
+```
+
+70km distance band neighborhood definition
+
+```{r}
+poSurfKreise <- st_point_on_surface(covidKreise)
+
+distnb <- dnearneigh(poSurfKreise, d1=1, d2= 70*10^3)
+```
+
+Union contiguity and distance based neighborhood definitions
+
+
+```{r}
+unionedNb <- union.nb(distnb, polynb)
+
+
+plot(st_geometry(covidKreise), border = "grey60", reset = FALSE)
+plot(unionedNb, coords=st_coordinates(poSurfKreise), col="red",  cex=.7, add=TRUE)
+```
+
+Inverse distance based weighting of neighbors
+
+
+```{r}
+dlist <- nbdists(unionedNb, st_coordinates(poSurfKreise))
+dlist <- lapply(dlist, function(x) 1/x)
+unionedListw_d <- nb2listw(unionedNb, glist=dlist, style = "W")
+```
+
+# Regression modelling
+
+## Non-spatial GLM
+
+```{r, mysize=TRUE, size="\\tiny"}
+g <- glm(casesTillEnd5thWave ~ Stimmenanteile.AfD + 
+                         Auslaenderanteil + Hochqualifizierte + 
+                         Langzeitarbeitslosenquote + 
+                         Einpendler, 
+                       family = quasipoisson, 
+                       data = covidKreise, 
+                       offset = log(EWZ))
+summary(g)
+```
+Use the variance inflation factor to check for problems with collinearity:
+
+```{r}
+car::vif(g)
+```
+
+Low collinearity.
+
+## Spatial eigenvector selection
+
+```{r, echo = TRUE, mysize=TRUE, size="\\tiny", cache=TRUE}
+set.seed(42)
+meQp <- spatialreg::ME(casesTillEnd5thWave ~ Stimmenanteile.AfD + 
+                         Auslaenderanteil + Hochqualifizierte + 
+                         Langzeitarbeitslosenquote + 
+                         Einpendler , 
+                       family = quasipoisson, 
+                       data = covidKreise, 
+                       offset = log(EWZ), 
+                       listw = unionedListw_d)
+```
+
+## Refitting GLM with selected SEVs
+
+```{r, echo = TRUE, mysize=TRUE, size="\\tiny"}
+modelSevmQp <- glm(casesTillEnd5thWave ~ Stimmenanteile.AfD + Auslaenderanteil + 
+                         Hochqualifizierte + Langzeitarbeitslosenquote + 
+                         Einpendler  + fitted(meQp),
+                   family = quasipoisson, 
+                   data = covidKreise, 
+                   offset = log(EWZ))
+
+summary(modelSevmQp)
+```
+
+Add the spatial eigenvectors to the spatial data frame:
+
+
+```{r}
+summary(fitted(meQp))
+sevQp <- fitted(meQp)
+covidKreiseSvem <- st_sf(data.frame(covidKreise, sevQp))
+```
+Plot the spatial eigenvectors:
+
+```{r}
+#theBreaks <- seq(from = min(fitted(meQp)), to = max(fitted(meQp)), length.out= 6)
+tm_shape(covidKreiseSvem) + 
+  tm_polygons(fill= colnames(sevQp), 
+              fill.legend = tm_legend(show = FALSE, title="Eigenvector", reverse=TRUE),
+              fill.scale = tm_scale_intervals(values = "-brewer.rd_bu", n=7, midpoint=0), 
+              lwd=.5) + 
+  tm_layout(panel.show = TRUE, 
+            panel.labels = colnames(sevQp)) +
+  tm_scalebar(position = tm_pos_out(cell.h = "center", cell.v="center",
+                                    pos.h= .85, pos.v= 0.4)) +
+  tm_title("Selected spatial eigenvectors")
+```
+
+
+## Spatially varying regression coefficients
+
+### Model selection
+
+We test for spatial varying regression coefficients for the share of foreigners. As we are using a quasipoisson GLM we are using an F-test based on analysis of deviance for the model selection.
+
+#### Share of foreigners
+
+```{r}
+modelSevmQpInt <- glm(casesTillEnd5thWave ~ Stimmenanteile.AfD +  
+    Hochqualifizierte + Langzeitarbeitslosenquote + Einpendler  + 
+      Auslaenderanteil*(vec4 + vec6 + vec13 +  vec16 + vec20 +  vec21  + vec22 + vec26 + vec36),
+                   family = quasipoisson, offset = log(EWZ), 
+                   data = covidKreiseSvem)
+drop1(modelSevmQpInt, test="F")
+```
+
+```{r}
+modelSevmQpInt <- update(modelSevmQpInt, ~. -Auslaenderanteil:vec26)
+drop1(modelSevmQpInt, test="F")
+```
+
+```{r}
+modelSevmQpInt <- update(modelSevmQpInt, ~. -Auslaenderanteil:vec22)
+drop1(modelSevmQpInt, test="F")
+```
+
+
+```{r}
+modelSevmQpInt <- update(modelSevmQpInt, ~. -Auslaenderanteil:vec21)
+drop1(modelSevmQpInt, test="F")
+```
+
+```{r}
+modelSevmQpInt <- update(modelSevmQpInt, ~. -Auslaenderanteil:vec16)
+drop1(modelSevmQpInt, test="F")
+```
+
+
+```{r}
+modelSevmQpInt <- update(modelSevmQpInt, ~. -vec26)
+drop1(modelSevmQpInt, test="F")
+```
+
+```{r}
+summary(modelSevmQpInt)
+```
+
+
+
+The explained deviance increased a bit by adding the interaction, but not dramatically.
+
+```{r}
+1 - modelSevmQpInt$deviance / modelSevmQpInt$null.deviance
+```
+
+```{r}
+1 - modelSevmQp$deviance / modelSevmQp$null.deviance
+```
+
+#### Long-term unemployment rate
+
+```{r}
+modelSevmQpInt2 <- glm(formula = casesTillEnd5thWave ~ Stimmenanteile.AfD + Hochqualifizierte + 
+    Langzeitarbeitslosenquote + Einpendler + Auslaenderanteil + 
+    vec4 + vec6 + vec13 + vec16 + vec20 + vec21 + vec22 + vec36 + 
+    Auslaenderanteil:vec4 + Auslaenderanteil:vec6 + Auslaenderanteil:vec13 + 
+    Auslaenderanteil:vec20 + Auslaenderanteil:vec36 +
+    vec4:Langzeitarbeitslosenquote + vec6:Langzeitarbeitslosenquote + vec13:Langzeitarbeitslosenquote + vec16:Langzeitarbeitslosenquote + vec20:Langzeitarbeitslosenquote + vec21:Langzeitarbeitslosenquote + vec22:Langzeitarbeitslosenquote + vec36:Langzeitarbeitslosenquote  , family = quasipoisson, 
+    data = covidKreiseSvem, offset = log(EWZ))
+
+drop1(modelSevmQpInt2, test="F")
+```
+
+```{r}
+modelSevmQpInt2 <- update(modelSevmQpInt2 ,~ . -Langzeitarbeitslosenquote:vec16)
+drop1(modelSevmQpInt2, test="F")
+```
+
+```{r}
+modelSevmQpInt2 <- update(modelSevmQpInt2 ,~ . -Langzeitarbeitslosenquote:vec36)
+drop1(modelSevmQpInt2, test="F")
+```
+
+```{r}
+modelSevmQpInt2 <- update(modelSevmQpInt2 ,~ . -Langzeitarbeitslosenquote:vec13)
+drop1(modelSevmQpInt2, test="F")
+```
+
+```{r}
+modelSevmQpInt2 <- update(modelSevmQpInt2 ,~ . -Langzeitarbeitslosenquote:vec6)
+drop1(modelSevmQpInt2, test="F")
+```
+
+```{r}
+modelSevmQpInt2 <- update(modelSevmQpInt2 ,~ . -Langzeitarbeitslosenquote:vec22)
+drop1(modelSevmQpInt2, test="F")
+```
+
+
+```{r}
+1 - modelSevmQpInt$deviance / modelSevmQpInt$null.deviance
+1 - modelSevmQpInt2$deviance / modelSevmQpInt2$null.deviance
+```
+
+```{r}
+summary(modelSevmQpInt2)
+```
+
+#### Share of votes for the right-winged party
+
+Test spatial varying coefficients for share ofd votes for the right winged party:
+
+```{r}
+modelSevmQpInt3 <- glm(formula = casesTillEnd5thWave ~ Stimmenanteile.AfD + Hochqualifizierte + 
+    Langzeitarbeitslosenquote + Einpendler + Auslaenderanteil + 
+    vec4 + vec6 + vec13 + vec16 + vec20 + vec21 + vec22 + vec36 + 
+    Auslaenderanteil:vec4 + Auslaenderanteil:vec6 + Auslaenderanteil:vec13 + 
+    Auslaenderanteil:vec20 + Auslaenderanteil:vec36 + Langzeitarbeitslosenquote:vec4 + 
+    Langzeitarbeitslosenquote:vec20 + Langzeitarbeitslosenquote:vec21 + 
+    vec4:Stimmenanteile.AfD + vec6:Stimmenanteile.AfD + vec13:Stimmenanteile.AfD + 
+      vec16:Stimmenanteile.AfD + vec20:Stimmenanteile.AfD + vec21:Stimmenanteile.AfD +
+      vec22:Stimmenanteile.AfD + vec36:Stimmenanteile.AfD, 
+    family = quasipoisson, data = covidKreiseSvem, offset = log(EWZ))
+drop1(modelSevmQpInt3, test="F")
+```
+
+
+```{r}
+modelSevmQpInt3 <- update(modelSevmQpInt3 ,~ . -Stimmenanteile.AfD:vec22 )
+drop1(modelSevmQpInt3, test="F")
+```
+
+```{r}
+modelSevmQpInt3 <- update(modelSevmQpInt3 ,~ . -Stimmenanteile.AfD:vec4 )
+drop1(modelSevmQpInt3, test="F")
+```
+
+```{r}
+modelSevmQpInt3 <- update(modelSevmQpInt3 ,~ . -Stimmenanteile.AfD:vec36 )
+drop1(modelSevmQpInt3, test="F")
+```
+
+```{r}
+modelSevmQpInt3 <- update(modelSevmQpInt3 ,~ . -Stimmenanteile.AfD:vec6 )
+drop1(modelSevmQpInt3, test="F")
+```
+
+```{r}
+modelSevmQpInt3 <- update(modelSevmQpInt3 ,~ . -Stimmenanteile.AfD:vec16 )
+drop1(modelSevmQpInt3, test="F")
+```
+
+```{r}
+modelSevmQpInt3 <- update(modelSevmQpInt3 ,~ . -Stimmenanteile.AfD:vec20 )
+drop1(modelSevmQpInt3, test="F")
+```
+
+```{r}
+modelSevmQpInt3 <- update(modelSevmQpInt3 ,~ . -Stimmenanteile.AfD:vec21 )
+drop1(modelSevmQpInt3, test="F")
+```
+
+```{r}
+modelSevmQpInt3 <- update(modelSevmQpInt3 ,~ . -Stimmenanteile.AfD:vec13 )
+drop1(modelSevmQpInt3, test="F")
+```
+
+No spatial varying regression coefficient for the share of votes for the right winged party.
+
+#### Share of incomming commuters
+
+Test spatial varying coefficients for share of incomming commuters:
+
+```{r}
+modelSevmQpInt4 <- glm(formula = casesTillEnd5thWave ~ Stimmenanteile.AfD + Hochqualifizierte + 
+    Langzeitarbeitslosenquote + Einpendler + Auslaenderanteil + 
+    vec4 + vec6 + vec13 + vec16 + vec20 + vec21 + vec22 + vec36 + 
+    Auslaenderanteil:vec4 + Auslaenderanteil:vec6 + Auslaenderanteil:vec13 + 
+    Auslaenderanteil:vec20 + Auslaenderanteil:vec36 + Langzeitarbeitslosenquote:vec4 + 
+    Langzeitarbeitslosenquote:vec20 + Langzeitarbeitslosenquote:vec21 + 
+    vec4:Einpendler + vec6:Einpendler + vec13:Einpendler + 
+      vec16:Einpendler + vec20:Einpendler + vec21:Einpendler +
+      vec22:Einpendler + vec36:Einpendler, 
+    family = quasipoisson, data = covidKreiseSvem, offset = log(EWZ))
+drop1(modelSevmQpInt4, test="F")
+```
+
+```{r}
+modelSevmQpInt4 <- update(modelSevmQpInt4 ,~ . -Einpendler:vec36 )
+drop1(modelSevmQpInt4, test="F")
+```
+
+```{r}
+modelSevmQpInt4 <- update(modelSevmQpInt4 ,~ . -Auslaenderanteil:vec6 )
+drop1(modelSevmQpInt4, test="F")
+```
+
+```{r}
+modelSevmQpInt4 <- update(modelSevmQpInt4 ,~ . -Einpendler:vec22 )
+drop1(modelSevmQpInt4, test="F")
+```
+
+```{r}
+modelSevmQpInt4 <- update(modelSevmQpInt4 ,~ . -Einpendler:vec16 )
+drop1(modelSevmQpInt4, test="F")
+```
+
+```{r}
+modelSevmQpInt4 <- update(modelSevmQpInt4 ,~ . -Einpendler:vec13 )
+drop1(modelSevmQpInt4, test="F")
+```
+
+```{r}
+modelSevmQpInt4 <- update(modelSevmQpInt4 ,~ . -Einpendler:vec21 )
+drop1(modelSevmQpInt4, test="F")
+```
+
+
+```{r}
+modelSevmQpInt4 <- update(modelSevmQpInt4 ,~ . -Einpendler:vec20 )
+drop1(modelSevmQpInt4, test="F")
+```
+
+Small increase in explained deviance
+
+```{r}
+1 - modelSevmQpInt$deviance / modelSevmQpInt$null.deviance
+1 - modelSevmQpInt2$deviance / modelSevmQpInt2$null.deviance
+1 - modelSevmQpInt4$deviance / modelSevmQpInt4$null.deviance
+```
+
+```{r}
+summary(modelSevmQpInt4)
+```
+
+#### Share of high qualified employees
+
+Test spatial varying coefficients for share of high qualified employees:
+
+```{r}
+modelSevmQpInt5 <- glm(formula = casesTillEnd5thWave ~ Stimmenanteile.AfD + Hochqualifizierte + 
+    Langzeitarbeitslosenquote + Einpendler + Auslaenderanteil + 
+    vec4 + vec6 + vec13 + vec16 + vec20 + vec21 + vec22 + vec36 + 
+    Auslaenderanteil:vec4 + Auslaenderanteil:vec13 + Auslaenderanteil:vec20 + 
+    Auslaenderanteil:vec36 + Langzeitarbeitslosenquote:vec4 + 
+    Langzeitarbeitslosenquote:vec20 + Langzeitarbeitslosenquote:vec21 + 
+    Einpendler:vec4 + Einpendler:vec6 + 
+    vec4:Hochqualifizierte + vec6:Hochqualifizierte + vec13:Hochqualifizierte + 
+      vec16:Hochqualifizierte + vec20:Hochqualifizierte + vec21:Hochqualifizierte + 
+      vec22:Hochqualifizierte + vec36:Hochqualifizierte, 
+    family = quasipoisson, data = covidKreiseSvem, offset = log(EWZ))
+drop1(modelSevmQpInt5, test="F")
+```
+
+```{r}
+modelSevmQpInt5 <- update(modelSevmQpInt5 ,~ . -Hochqualifizierte:vec36 )
+drop1(modelSevmQpInt5, test="F")
+```
+
+```{r}
+modelSevmQpInt5 <- update(modelSevmQpInt5 ,~ . -Hochqualifizierte:vec4 )
+drop1(modelSevmQpInt5, test="F")
+```
+
+```{r}
+modelSevmQpInt5 <- update(modelSevmQpInt5 ,~ . -Hochqualifizierte:vec13 )
+drop1(modelSevmQpInt5, test="F")
+```
+
+```{r}
+modelSevmQpInt5 <- update(modelSevmQpInt5 ,~ . -Auslaenderanteil:vec20    )
+drop1(modelSevmQpInt5, test="F")
+```
+
+```{r}
+modelSevmQpInt5 <- update(modelSevmQpInt5 ,~ . -Hochqualifizierte:vec21   )
+drop1(modelSevmQpInt5, test="F")
+```
+
+```{r}
+modelSevmQpInt5 <- update(modelSevmQpInt5 ,~ . -Hochqualifizierte:vec16  )
+drop1(modelSevmQpInt5, test="F")
+```
+
+```{r}
+modelSevmQpInt5 <- update(modelSevmQpInt5 ,~ . -Einpendler:vec6  )
+drop1(modelSevmQpInt5, test="F")
+```
+```{r}
+modelSevmQpInt5 <- update(modelSevmQpInt5 ,~ . -Langzeitarbeitslosenquote:vec20  )
+drop1(modelSevmQpInt5, test="F")
+```
+
+```{r}
+modelSevmQpInt5 <- update(modelSevmQpInt5 ,~ . -Hochqualifizierte:vec22  )
+drop1(modelSevmQpInt5, test="F")
+```
+
+```{r}
+modelSevmQpInt5 <- update(modelSevmQpInt5 ,~ . -vec22  )
+drop1(modelSevmQpInt5, test="F")
+```
+
+```{r}
+summary(modelSevmQpInt5)
+```
+
+Small drop in explained deviance
+
+```{r}
+1 - modelSevmQpInt$deviance / modelSevmQpInt$null.deviance
+1 - modelSevmQpInt2$deviance / modelSevmQpInt2$null.deviance
+1 - modelSevmQpInt4$deviance / modelSevmQpInt4$null.deviance
+1 - modelSevmQpInt5$deviance / modelSevmQpInt5$null.deviance
+```
+
+Left over spatial autocorrelation:
+
+```{r}
+lm.morantest(g, listw = unionedListw_d)
+lm.morantest(modelSevmQp, listw = unionedListw_d)
+lm.morantest(modelSevmQpInt5, listw = unionedListw_d)
+```
+
+
+### Plotting spatially varying regression coefficients (at link scale)
+
+We calculate the resulting regression coefficient for each district:
+
+$$y = \beta_1 * Auslaenderanteil + \beta_2 * Auslaenderanteil * vec4 + $$
+$$ + \beta_3 * Auslaenderanteil * vec13  + ... =$$
+$$= Auslaenderanteil * (\beta_1 + \beta_2 * vec4 + \beta_3 * vec13 ) + ...$$
+where $(\beta_1 + \beta_2 * vec4 + \beta_3 * vec13 )$ represents the resulting regression coefficient per district.
+
+
+```{r}
+covidKreiseSvem <- mutate(covidKreiseSvem,
+                          coefForeigner = coef(modelSevmQpInt5)["Auslaenderanteil"] + 
+                            vec4*coef(modelSevmQpInt5)["Auslaenderanteil:vec4"] + 
+                            vec13*coef(modelSevmQpInt5)["Auslaenderanteil:vec13"] + 
+                            vec36*coef(modelSevmQpInt5)["Auslaenderanteil:vec36"],
+                          coefComm = coef(modelSevmQpInt5)["Einpendler"] + 
+                            vec4*coef(modelSevmQpInt5)["Einpendler:vec4"] ,
+                          coefUnempl = coef(modelSevmQpInt5)["Langzeitarbeitslosenquote"] + 
+                            vec4*coef(modelSevmQpInt5)["Langzeitarbeitslosenquote:vec4"] + 
+                            vec20*coef(modelSevmQpInt5)["Langzeitarbeitslosenquote:vec21"],
+                          coefHighQual = coef(modelSevmQpInt5)["Hochqualifizierte"] + 
+                            vec4*coef(modelSevmQpInt5)["Hochqualifizierte:vec6"] + 
+                            vec20*coef(modelSevmQpInt5)["Hochqualifizierte:vec20"],
+                          sumEigenvec = vec4*coef(modelSevmQpInt5)["vec4"] +
+                            vec6*coef(modelSevmQpInt5)["vec6"] +
+                            vec13*coef(modelSevmQpInt5)["vec13"] + 
+                            vec16*coef(modelSevmQpInt5)["vec16"] +
+                            vec21*coef(modelSevmQpInt5)["vec20"] + 
+                            vec21*coef(modelSevmQpInt5)["vec21"] +
+                            vec36*coef(modelSevmQpInt5)["vec36"]) 
+```
+
+
+Regression coefficient (link scale) for share of foreigners
+
+```{r}
+tmap_mode("plot")
+
+mCoefForeigner_link <- tm_shape(covidKreiseSvem) + tm_polygons(fill = "coefForeigner",
+                           fill.legend= tm_legend(title = "Regr. coefficient",
+                                                reverse=TRUE),
+                           fill.scale= tm_scale_intervals(values = "-brewer.rd_bu",
+                                                          midpoint= 0, n=6)) +
+  tm_shape(federalStates) + 
+  tm_borders(lwd=2) +
+  tm_layout(bg.color = "white", outer.bg.color = "white") +
+  tm_title("Share foreigners") +
+  tm_scalebar(position = tm_pos_out(cell.h="right", cell.v="center",
+                                    pos.h=0, pos.v=.1))
+
+mCoefForeigner_link
+```
+
+Regression coefficient (link scale) for longterm unemployment rate
+
+```{r}
+mCoefComm_link <- tm_shape(covidKreiseSvem) + tm_polygons(fill = "coefComm",
+                         fill.legend= tm_legend(title = "Regr. coefficient",
+                                                reverse=TRUE),
+                         fill.scale= tm_scale_intervals(values = "-brewer.rd_bu",
+                                                        midpoint= 0, n=6)) +
+  tm_shape(federalStates) + 
+  tm_borders(lwd=2) +
+tm_layout(bg.color = "white", outer.bg.color = "white") +
+tm_title("Incoming commuters") +
+tm_scalebar(position = tm_pos_out(cell.h="right", cell.v="center",
+                                  pos.h=0, pos.v=.1))
+
+mCoefComm_link
+```
+
+Regression coefficient (link scale) for long term unemployment rate
+
+```{r}
+mCoefUnempl_linkl <- tm_shape(covidKreiseSvem) + tm_polygons(fill = "coefUnempl",
+                         fill.legend= tm_legend(title = "Regr. coefficient",
+                                                reverse=TRUE),
+                         fill.scale= tm_scale_intervals(values = "-brewer.rd_bu",
+                                                        midpoint= 0, n=6)) +
+  tm_shape(federalStates) + 
+  tm_borders(lwd=2) +
+tm_layout(bg.color = "white", outer.bg.color = "white") +
+tm_title("Long term unemployment rate") +
+tm_scalebar(position = tm_pos_out(cell.h="right", cell.v="center",
+                                  pos.h=0, pos.v=.1))
+mCoefUnempl_linkl
+```
+
+Regression coefficient (link scale) for share of highly qualified employees
+
+```{r}
+mCoefHighQual_link <- tm_shape(covidKreiseSvem) + tm_polygons(fill = "coefHighQual",
+                           fill.legend= tm_legend(title = "Regr. coefficient",
+                                                reverse=TRUE),
+                           fill.scale= tm_scale_intervals(values = "-brewer.rd_bu",
+                                                          midpoint= 0, n=6)) +
+  tm_shape(federalStates) + 
+  tm_borders(lwd=2) +
+  tm_layout(bg.color = "white", outer.bg.color = "white") +
+  tm_title("Highly qualified employees") +
+  tm_scalebar(position = tm_pos_out(cell.h="right", cell.v="center",
+                                    pos.h=0, pos.v=.1))
+
+mCoefHighQual_link
+```
+
+"Main effect" of the selected spatial eigenvectors:
+
+```{r}
+mEV_link <- tm_shape(covidKreiseSvem) + tm_polygons(fill = "sumEigenvec",
+                         fill.legend= tm_legend(title = "Effect EV",
+                                                reverse=TRUE),
+                         fill.scale= tm_scale_intervals(values = "-brewer.rd_bu",
+                                                        midpoint= 0, n=6)) +
+  tm_shape(federalStates) + 
+  tm_borders(lwd=2) +
+tm_layout(bg.color = "white", outer.bg.color = "white") +
+#tm_title("Main effect EV") +
+tm_scalebar(position = tm_pos_out(cell.h="right", cell.v="center",
+                                  pos.h=0, pos.v=.1))
+mEV_link
+```
+
+
+Figure for manuscript
+
+```{r}
+mCombiCoef <- tmap_arrange(mCoefForeigner_link, mCoefUnempl_linkl,
+             mCoefComm_link, mCoefHighQual_link)
+
+tmap_save(mCombiCoef,
+          filename = "img/coefMapsLinkScale.png",
+          height=1400*2, width=1400*2, units="px")
+```
+
+
+
+```{r}
+tmap_save(mEV_link,
+          filename = "img/EVeffectMapLinkScale.png",
+          height=700*2, width=700*2, units="px")
+```
+
+
+For interpretation and looking up district names we use interactive maps.
+
+```{r}
+tmap_mode("view")
+
+tm_shape(covidKreiseSvem) + 
+  tm_polygons(fill = "coefForeigner",
+              popup.vars = "GEN",
+              fill.legend= tm_legend(title = "Regr. coefficient"),
+              fill.scale= tm_scale_intervals(values = "-brewer.rd_bu",
+                                             midpoint= 0, n=6)) +
+  tm_layout(bg.color = "white", outer.bg.color = "white") +
+  tm_title("Share foreigners") +
+  tm_scalebar(position = tm_pos_out(cell.h="right", cell.v="center",
+                                    pos.h=0, pos.v=.1))
+```
+
+```{r}
+tmap_mode("view")
+tm_shape(covidKreiseSvem) + 
+  tm_polygons(fill = "coefUnempl",
+              popup.vars = "GEN",
+                         fill.legend= tm_legend(title = "Regr. coefficient"),
+                         fill.scale= tm_scale_intervals(values = "-brewer.rd_bu",
+                                                        midpoint= 0, n=6)) +
+tm_layout(bg.color = "white", outer.bg.color = "white") +
+tm_title("Long term unemployment rate") +
+tm_scalebar(position = tm_pos_out(cell.h="right", cell.v="center",
+                                  pos.h=0, pos.v=.1))
+```
+
+
+```{r}
+tmap_mode("view")
+tm_shape(covidKreiseSvem) + 
+  tm_polygons(fill = "coefComm",
+              popup.vars = "GEN",
+                         fill.legend= tm_legend(title = "Regr. coefficient"),
+                         fill.scale= tm_scale_intervals(values = "-brewer.rd_bu",
+                                                        midpoint= 0, n=6)) +
+tm_layout(bg.color = "white", outer.bg.color = "white") +
+tm_title("Incoming commuters") +
+tm_scalebar(position = tm_pos_out(cell.h="right", cell.v="center",
+                                  pos.h=0, pos.v=.1))
+
+mCoefComm_link
+```
+
+
+# Maps of resonse and selected predictors
+
+## Predictor maps
+
+```{r}
+theColorRamp <- "-scico.oslo"
+
+mForeigners <- tm_shape(covidKreiseSvem) + 
+tm_polygons(fill="Auslaenderanteil",
+            fill.chart= tm_chart_histogram(), 
+            fill.scale= tm_scale_intervals(values= theColorRamp, 
+                                           style = "fisher", n = 6),  
+            fill.legend= tm_legend(reverse = TRUE, 
+                                   title = "Share of foreigners")) +
+  #tm_title("Share of foreigners") +
+  tm_scalebar(position = tm_pos_out(cell.h="right", cell.v="center",
+                                  pos.h=0, pos.v=.1))
+
+mIncomCom <- tm_shape(covidKreiseSvem) + 
+tm_polygons(fill="Einpendler",
+            fill.chart= tm_chart_histogram(), 
+            fill.scale= tm_scale_intervals(values= theColorRamp,
+                                           style = "fisher", n = 6),  
+            fill.legend= tm_legend(reverse = TRUE, 
+                                   title = "Incoming commuters")) +
+  #tm_title("Share of foreigners") +
+  tm_scalebar(position = tm_pos_out(cell.h="right", cell.v="center",
+                                  pos.h=0, pos.v=.1))
+
+mAfD <- tm_shape(covidKreiseSvem) + 
+tm_polygons(fill="Stimmenanteile.AfD",
+            fill.chart= tm_chart_histogram(), 
+            fill.scale= tm_scale_intervals(values= theColorRamp,
+                                           style = "fisher", n = 6),  
+            fill.legend= tm_legend(reverse = TRUE, 
+                                   title = "Right-winged votes")) +
+  #tm_title("Share of foreigners") +
+  tm_scalebar(position = tm_pos_out(cell.h="right", cell.v="center",
+                                  pos.h=0, pos.v=.1))
+
+mHighQual <- tm_shape(covidKreiseSvem) + 
+tm_polygons(fill="Hochqualifizierte",
+            fill.chart= tm_chart_histogram(), 
+            fill.scale= tm_scale_intervals(values= theColorRamp,
+                                           style = "fisher", n = 6),  
+            fill.legend= tm_legend(reverse = TRUE, 
+                                   title = "Share high qualified")) +
+  #tm_title("Share of foreigners") +
+  tm_scalebar(position = tm_pos_out(cell.h="right", cell.v="center",
+                                  pos.h=0, pos.v=.1))
+
+mUnempl <- tm_shape(covidKreiseSvem) + 
+tm_polygons(fill="Langzeitarbeitslosenquote",
+            fill.chart= tm_chart_histogram(), 
+            fill.scale= tm_scale_intervals(values= theColorRamp,
+                                           style = "fisher", n = 6),  
+            fill.legend= tm_legend(reverse = TRUE, 
+                                   title = "Long-term unempl.")) +
+  #tm_title("Share of foreigners") +
+  tm_scalebar(position = tm_pos_out(cell.h="right", cell.v="center",
+                                  pos.h=0, pos.v=.1))
+```
+
+```{r}
+mPredictors <- tmap_arrange(mForeigners, mUnempl, mIncomCom, mHighQual, mAfD)
+
+mPredictors
+
+tmap_save(mPredictors,
+          filename = "img/predictorMaps.png",
+          height=1200*2, width=2000*2, units="px")
+```
+
+## Response maps
+
+```{r}
+theColorRamp <- "-hcl.purple_blue"
+
+mIncidence_tillEnd5th <- 
+  tm_shape(covidKreiseSvem) + 
+tm_polygons(fill="incidenceTillEnd5thWave",
+            fill.chart= tm_chart_histogram(), 
+            fill.scale= tm_scale_intervals(values= theColorRamp, 
+                                           style = "fisher", n = 6),  
+            fill.legend= tm_legend(reverse = TRUE, 
+                                   title = "Incidence rate\ntill end 5th wave")) +
+  #tm_title("Share of foreigners") +
+  tm_scalebar(position = tm_pos_out(cell.h="right", cell.v="center",
+                                  pos.h=0, pos.v=.1)) +
+  tm_layout(bg.color = "grey", outer.bg.color = "lightgrey")
+
+mIncidence_wave1 <- tm_shape(covidKreiseSvem) + 
+tm_polygons(fill="totalIncidence4phase_first_wave",
+            fill.chart= tm_chart_histogram(), 
+            fill.scale= tm_scale_intervals(values= theColorRamp, 
+                                           style = "fisher", n = 6),  
+            fill.legend= tm_legend(reverse = TRUE, 
+                                   title = "Incidence rate\n1th wave")) +
+  #tm_title("Share of foreigners") +
+  tm_scalebar(position = tm_pos_out(cell.h="right", cell.v="center",
+                                  pos.h=0, pos.v=.1))
+
+mIncidence_wave2 <- tm_shape(covidKreiseSvem) + 
+tm_polygons(fill="totalIncidence4phase_second_wave",
+            fill.chart= tm_chart_histogram(), 
+            fill.scale= tm_scale_intervals(values= theColorRamp, 
+                                           style = "fisher", n = 6),  
+            fill.legend= tm_legend(reverse = TRUE, 
+                                   title = "Incidence rate\n2nd wave")) +
+  #tm_title("Share of foreigners") +
+  tm_scalebar(position = tm_pos_out(cell.h="right", cell.v="center",
+                                  pos.h=0, pos.v=.1))
+
+mIncidence_wave3 <- tm_shape(covidKreiseSvem) + 
+tm_polygons(fill="totalIncidence4phase_third_wave",
+            fill.chart= tm_chart_histogram(), 
+            fill.scale= tm_scale_intervals(values= theColorRamp, 
+                                           style = "fisher", n = 6),  
+            fill.legend= tm_legend(reverse = TRUE, 
+                                   title = "Incidence rate\n3rd wave")) +
+  #tm_title("Share of foreigners") +
+  tm_scalebar(position = tm_pos_out(cell.h="right", cell.v="center",
+                                  pos.h=0, pos.v=.1))
+
+mIncidence_wave4 <- tm_shape(covidKreiseSvem) + 
+tm_polygons(fill="totalIncidence4phase_fourth_wave",
+            fill.chart= tm_chart_histogram(), 
+            fill.scale= tm_scale_intervals(values= theColorRamp, 
+                                           style = "fisher", n = 6),  
+            fill.legend= tm_legend(reverse = TRUE, 
+                                   title = "Incidence rate\n4th wave")) +
+  #tm_title("Share of foreigners") +
+  tm_scalebar(position = tm_pos_out(cell.h="right", cell.v="center",
+                                  pos.h=0, pos.v=.1))
+
+mIncidence_wave5 <- tm_shape(covidKreiseSvem) + 
+tm_polygons(fill="totalIncidence4phase_fifth_wave",
+            fill.chart= tm_chart_histogram(), 
+            fill.scale= tm_scale_intervals(values= theColorRamp, 
+                                           style = "fisher", n = 6),  
+            fill.legend= tm_legend(reverse = TRUE, 
+                                   title = "Incidence rate\n5th wave")) +
+  #tm_title("Share of foreigners") +
+  tm_scalebar(position = tm_pos_out(cell.h="right", cell.v="center",
+                                  pos.h=0, pos.v=.1))
+```
+
+```{r}
+mResponse <- tmap_arrange(mIncidence_tillEnd5th,
+             mIncidence_wave1, mIncidence_wave2, mIncidence_wave3,
+             mIncidence_wave4, mIncidence_wave5)
+
+tmap_save(mResponse,
+          filename = "img/responseMaps.png",
+          height=1200*2, width=2000*2, units="px")
+```
+
+# Clustering of spatially varying regression coefficients
+
+```{r}
+library (vegan)  
+library(cluster)
+```
+
+Normalize the regression coefficients and calculate the euclidian distance
+
+```{r}
+variables <- c("coefForeigner", "coefComm", "coefUnempl", "coefHighQual")
+distm <- decostand(x=covidKreiseSvem[, variables] %>% 
+                     st_drop_geometry(), 
+                   method = "standardize") %>% dist(method="euclian")
+```
+
+Hierarchical clustering using WARD
+
+```{r}
+coef.ward <- hclust(distm, method="ward.D2")
+plot(coef.ward, main="Reg. coef. - Ward")
+```
+
+We cut the dendogram so that the derive 4 clusters and assign the clusters to the corresponding districts
+
+```{r}
+coefCluster4 <- cutree(coef.ward, k = 4)
+covidKreiseSvem$cluster4 <- coefCluster4
+```
+
+```{r}
+tmap_mode("plot")
+
+mCluster <- tm_shape(covidKreiseSvem) +
+  tm_polygons(fill="cluster4",
+              fill.scale = tm_scale_categorical(n.max=4, values = "-met.egypt"),
+              fill.legend = tm_legend(title= "Cluster")) +
+  tm_shape(federalStates) + 
+  tm_borders(lwd=2) +
+  tm_scalebar(position = tm_pos_out(cell.h="right", cell.v="center",
+                                  pos.h=0, pos.v=.1))
+mCluster
+
+tmap_save(mCluster,
+          filename = "img/clusterMaps.png",
+          height=700*2, width=700*2, units="px")
+```
+
+Calculate summary statistics for the different clusters:
+
+```{r}
+variabibles4ClusterStats <- c( "coefForeigner", "coefComm", "coefUnempl", "coefHighQual",
+                               "sumEigenvec",
+                               "incidenceTillEnd5thWave",
+                               "Langzeitarbeitslosenquote", "Hochqualifizierte", "Stimmenanteile.AfD",
+                               "Auslaenderanteil", "Einpendler"  )
+
+covidKreiseSvem %>% st_drop_geometry() %>%
+  select(c("cluster4", variabibles4ClusterStats)) %>%
+  group_by(cluster4) %>%
+  summarise(across(all_of(variabibles4ClusterStats), list(mean=mean, sd=sd),.unpack = TRUE)) %>%
+  pivot_longer(cols=!cluster4) %>%
+  pivot_wider(names_from=cluster4, names_prefix = "Cluster_")
+```
+
